@@ -1,4 +1,5 @@
 #include <string.h>
+#include <stdio.h>
 
 #include "api.h"
 #include "parser.h"
@@ -9,17 +10,16 @@ int is_cmd(const char* buf)   {
 }
 
 int parse_cmd(char *cmd, int is_logged_in) {
-    size_t len = strlen(cmd);
-    if(strncmp(cmd, "/register", len) == 0)   {
+    if(strncmp(cmd, "/register\0", 10) == 0)   {
         return !is_logged_in ? REGISTER : INVALID_CMD;
     }
-    if(strncmp(cmd, "/login", len) == 0)  {
+    if(strncmp(cmd, "/login\0", 7) == 0)  {
         return !is_logged_in ? LOGIN : INVALID_CMD;
     }
-    if(strncmp(cmd, "/users", len) == 0)  {
+    if(strncmp(cmd, "/users\0", 8) == 0)  {
         return is_logged_in ? USERS : INVALID_CMD;
     }
-    if(strncmp(cmd, "/exit", len) == 0)   {
+    if(strncmp(cmd, "/exit\0", 6) == 0)   {
         return EXIT;
     }
     return UNKNOWN_CMD;
