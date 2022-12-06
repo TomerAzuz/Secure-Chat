@@ -40,7 +40,7 @@ int api_send(SSL *ssl, int fd, struct api_msg *msg) {
     return 0;
 }
 
-int send_msg_status(SSL *ssl, int fd, int msg_type, const char *username)  {
+int send_msg_type(SSL *ssl, int fd, int msg_type, const char *username)  {
     struct api_msg *msg = calloc(1, sizeof(struct api_msg));
     msg->type = msg_type;
     if(msg->type == AUTH_ERROR) {
@@ -59,8 +59,8 @@ void api_init_msg(struct api_msg *msg) {
     memset(msg->pwd, '\0', PWD_LEN);
     memset(msg->timestamp, '\0', TIMESTAMP_LEN);
     memset(msg->sig, '\0', SIG_LEN);
-    memset(msg->aes, '\0', RSA_LEN);
-    msg->cert = NULL;
+    memset(msg->aes1, '\0', RSA_LEN);
+    memset(msg->aes2, '\0', RSA_LEN);
 }
 
 /**
@@ -70,7 +70,6 @@ void api_init_msg(struct api_msg *msg) {
 void api_recv_free(struct api_msg *msg) {
     assert(msg);
     memset(msg, 0, sizeof(*msg));
-    X509_free(msg->cert);
 }
 
 /**

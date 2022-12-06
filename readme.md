@@ -9,15 +9,14 @@ The server calls `fork` for each incoming connection, thereby allowing to servic
   * The input sent by the user is sanitized (in `sanitizer.c`), parsed (in `parser.c`) and processed (in `client.c`).
 * The client and the server interact via an api (`api.c`), by using the socket `send()` and `recv()` calls.
   * The client and the server use the `api_msg` struct to store the data about the message.
-  * Before sending the message with its metadata, the sender sends the size of the message (and its metadata), so that the receiver knows how much data is expected to be read.
   * The data about the message contains the following fields:
     * A buffer to store the message (a private message is sent encrypted)
     * The type of the message
-    * The sender associated with the client
+    * The username associated with the client
     * The (hashed) password associated with the client (if applicable)
     * The timestamp of the message (if applicable)
-    * The client's public key (for registration only)
-    * The recipient's sender (for private messages only)
+    * The client's public key (for registration only) *(not implemented)*
+    * The recipient's username (for private messages only)
     * Encrypted AES key (for private messages only)
   * At the receiver's end, the message is parsed and processed according to its type.
 * Whenever an incoming message from the client is received by the worker, all other workers are notified and the message is forwarded to their clients. 
@@ -29,13 +28,15 @@ The server calls `fork` for each incoming connection, thereby allowing to servic
 ### Message Format
 * public message:&nbsp;&nbsp;&nbsp; "message"
 * private message:&nbsp; @recipient "message"
-* register: &ensp;&emsp;&ensp;&emsp;&ensp;&ensp; /register sender password
-* login: &emsp;&emsp;&emsp;&emsp;&emsp;&nbsp;&nbsp;/login sender password
+* register: &ensp;&emsp;&ensp;&emsp;&ensp;&ensp; /register username password
+* login: &emsp;&emsp;&emsp;&emsp;&emsp;&nbsp;&nbsp;/login username password
 * online users:&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; /users
 * exit:  &emsp;&emsp;&emsp;&emsp;&ensp;&emsp;&nbsp; /exit
 
 ### Message Types
-
+* `USER_NOT_FOUND` - User sends a private message to a non existing recipient.
+* `USERNAME_TAKEN` - Username registers with an existing username
+* `AUTH_ERROR` - User authentication failed
 * `UNKNOWN CMD` - User sends a command not listed in `Message Format`.
 * `INVALID CMD` - User sends an unauthorized command while logged out, or sends `register` or `login` command while logged in.
 * `INVALID_FORMAT` - User sends a command with insufficient or too many arguments, or sends arguments that exceed the allowed length.
@@ -43,6 +44,7 @@ The server calls `fork` for each incoming connection, thereby allowing to servic
 * `LOGIN` - `login` command
 * `USERS` - List online users command
 * `PRIV_MSG` - Private message
+* `PUB_MSG` - Public message
 * `EXIT`  - `exit` command
 * A message with none of the above types is assumed to be public.
 
@@ -61,63 +63,72 @@ In case an invalid input is read, the type of the message is set to invalid and 
 An SSL connection ensures that any data sent over the socket is encrypted. <br>
 Therefore, all communication between the server and the client is protected from eavesdrppers. <br>
 In addition, the sender signs messages with his private key to ensure non-repudiation, as well as the integrity and authenticity of the message. <br>
-The receiver then verifies the signature using the sender's public key. <br>
+The receiver then verifies the signature using the sender's public key and verifies the public key by checking the sender's certificate.. <br>
 Furthermore, clients authenticate the server upon establishing a connection by checking the server's certificate.
 
 #### Registration
 The client receives the command and its arguments from `stdin`. <br>
 The client sends the message to the server with a hashed password. In that manner, the plaintext password remains invisible to the server. <br>
-Additionally, the client uses the TTP to generate a public and a private key, and sends the public key to the server over the socket which will be used to verify the client's signature. <br>
+Additionally, the client uses the TTP to generate a public and a private key, and sends the public key to the server over the socket which will be used to verify the client's signature. *(not implemented)* <br>
 To prevent rainbow table attacks, the server generates salt and concatenates it to the hashed password received from the client and hashes the resulted string. <br>
 The account of the user is then stored in the database in the following way:
 * Username in plaintext
 * Hash salted password
-* The salt of the password in plaintext 
-* The client's public key
+* The salt of the password in plaintext
 
 The following format describes a registration command sent by the client to the server: <br>
-`/register sender hashed_password public_key signature` <br>
-The server's response may indicate either a successful or unsuccessful registeration, which is sent to the client in plaintext over the socket. <br>
+`/register msg_type sender hashed_password public_key signature` <br>
+The server's response may indicate either a successful or unsuccessful registration, which is sent to the client in plaintext over the socket. <br>
 
 #### Logging in
 The client receives the command and its arguments from `stdin`. <br>
 The client performs the same procedure as for registration, except that now the public key is already stored in the database, and hence does not need to be sent over the socket. <br>
-The server verifies the signature, retrieves the salt from the database and concatenates it to the password received from the client. 
+The server verifies the signature *(not implemented)*, retrieves the salt from the database and concatenates it to the password received from the client. 
 The resulted string is hashed and compared to the password stored in the database. <br>
 The following format describes a login command sent by the client to the server:<br>
-`/login sender hashed_password signature` <br>
+`/login msg_type sender hashed_password signature` <br>
 Similar to registration, the server responds with either successful or unsuccessful login sent in plaintext over the socket. <br>
 
 #### Public Messages
 The client receives the message from `stdin`, signs the message with his private key and sends it to the server. <br>
-The server verifies the signature, stores the message in the database and notifies all other workers. <br>
+The server verifies the signature *(not implemented)*, stores the message in the database and notifies all other workers. <br>
 The following information about public messages is stored in the database:
 * The message in plaintext
-* The sender's sender
+* The sender's username
 * The timestamp of the message
+* The signature
 
+The client receiving the message verifies the sender's certificate and signature. <br>
 The following format describes a public message sent by the client to the server:<br>
-`"some message" signature`
+`"some message" msg_type sender timestamp signature`
 
 #### Private Messages
-The client receives a private message command from `stdin` followed by the recipient's sender and the message. <br>
+The client receives a private message command from `stdin` followed by the recipient's username and the message. <br>
 The client does the following before sending the message over the socket:
 * Uses the TTP to generates a symmetric (AES) key
 * Encrypts the plaintext message with the AES key
 * Encrypts the AES key with the recipient's public key
+* Encrypts the AES key with his own public key
 * Signs the message
 
+The client receiving the message verifies the sender's certificate and signature. <br>
 The following format describes a private message sent by the client to the server:<br>
-`"some message" AES_key (encrypted with the recipient's public key) signature` <br>
+`"some message" (encrypted with AES), msg_type, timestamp, sender,` 
+`recipient AES_key (encrypted with the recipient's public key),` 
+`(same)AES_key (encrypted with the sender's public key), signature`  <br>
 
 The following information about private messages is stored in the database:
 * The message in ciphertext
-* The sender's sender 
-* The recipient's sender
+* The sender's username 
+* The recipient's username
 * The timestamp of the message
-* The encrypted AES key
-
-To decrypt the message, the AES key is decrypted using the recipient's private key, and the ciphertext is then decrypted using the AES key. The process is repeated for every private message. <br>
+* The signature
+* The AES key encrypted with the recipient's private key
+* THe AES Key encrypted with the sender's private key
+The recipient verifies the sender's certificate and signature before processing it. <br>
+To decrypt the message, the AES key is decrypted using the recipient's private key, and the ciphertext is then decrypted using the AES key. <br>
+The sender can retrieve his own message by decrypting the second AES key with his own private key. <br>
+The process is repeated for every private message. <br>
 #### Users Command
 The client receives the `users` command from `stdin` signs and sends it over the socket. <br>
 The following format describes a `users` command sent by the client to the server: <br>

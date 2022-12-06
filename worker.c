@@ -26,14 +26,12 @@ struct worker_state {
 };
 
 int is_privmsg_for_me(const char *username, struct api_msg *msg) {
-    if(msg->type != PRIV_MSG) {
-        return PUB_MSG;
+    if(msg->type != PRIV_MSG) return 0;
+    if(strncmp(username, msg->sender, USERNAME_LEN-1) != 0 &&
+       strncmp(username, msg->recipient, USERNAME_LEN-1) != 0)  {
+        return -1;
     }
-    if((strncmp(username, msg->sender, USERNAME_LEN-1) == 0) ||
-       (strncmp(username, msg->recipient, USERNAME_LEN-1) == 0)) {
-        return 1;
-    }
-    return -1;
+    return 1;
 }
 /**
  * @brief Reads an incoming notification from the server and notifies
@@ -43,7 +41,7 @@ static int handle_s2w_notification(struct worker_state *state) {
     assert(state);
     struct api_msg *msg = get_last_msg();
     if(!msg)    {
-        return -1;
+        return 0;
     }
     if(is_privmsg_for_me(state->username, msg) < 0)  {
         free(msg);
@@ -102,18 +100,17 @@ int send_all_msgs(struct worker_state *state) {
     return 0;
 
     cleanup:
-    for(int i = 0; i < num_msgs-1; i++) {
-        free(all_msgs[i]);
-    }
-    free(all_msgs);
-    return -1;
+        for(int i = 0; i < num_msgs-1; i++) {
+            free(all_msgs[i]);
+        }
+        free(all_msgs);
+        return -1;
 }
 
 int handle_register(struct worker_state *state, struct api_msg *msg)  {
     assert(state);
     assert(msg);
     strncpy(state->username, msg->sender, USERNAME_LEN-1);
-    //EVP_PKEY *pubkey = X509_get0_pubkey(cacert);
     char *salt = (char*) generate_salt();
     if(!salt)   {
         return -1;
@@ -124,7 +121,7 @@ int handle_register(struct worker_state *state, struct api_msg *msg)  {
     if(store_account(state->username, msg->pwd, salt) != 0) {
         goto cleanup;
     }
-    if(send_msg_status(state->ssl, state->api.fd, REGISTER, NULL) != 0)  {
+    if(send_msg_type(state->ssl, state->api.fd, REGISTER, NULL) != 0)  {
         goto cleanup;
     }
     if(send_all_msgs(state) != 0) {
@@ -172,11 +169,11 @@ int handle_login(struct worker_state *state, struct api_msg *msg)  {
     strncpy(state->username, msg->sender, USERNAME_LEN-1);
     int r;
     if(auth_user(msg) != 0)    {
-        r = send_msg_status(state->ssl, state->api.fd, AUTH_ERROR, msg->sender);
+        r = send_msg_type(state->ssl, state->api.fd, AUTH_ERROR, msg->sender);
         return r < 0 ? r : 0;
     }
     else    {
-        r = send_msg_status(state->ssl, state->api.fd, LOGIN, NULL);
+        r = send_msg_type(state->ssl, state->api.fd, LOGIN, NULL);
         if(r != 0) return -1;
     }
     if(update_online(msg->sender, 1) != 1)  {
@@ -204,7 +201,6 @@ int handle_msg(struct worker_state *state,
                   const struct api_msg *msg)    {
     assert(state);
     assert(msg);
-
     int r = insert_msg(msg);
     if(r < 0) return -1;
     r = notify_workers(state);

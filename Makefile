@@ -9,17 +9,17 @@ clean:
 	rm -f server client *.o chat.db
 	rm -r -f keys
 
-ttp: clean ./ttp/ttp.sh ./ttp/init_server.sh ./ttp/init_client.sh ./ttp/gen_aes.sh ./ttp/remove_keypair.sh
-	chmod +x ./ttp/ttp.sh ./ttp/init_server.sh ./ttp/init_client.sh ./ttp/remove_keypair.sh
+ttp: clean ./ttp/ttp.sh ./ttp/gen_server_keys.sh ./ttp/gen_client_keys.sh ./ttp/gen_aes.sh
+	chmod +x ./ttp/ttp.sh ./ttp/gen_server_keys.sh ./ttp/gen_client_keys.sh
 	./ttp/ttp.sh
-	./ttp/init_server.sh
+	./ttp/gen_server_keys.sh
 
 chat.db:
 	sqlite3 chat.db "CREATE TABLE users(username TEXT NOT NULL, pwd TEXT NOT NULL, \
 									    salt TEXT NOT NULL, online INTEGER NOT NULL);\
 					 CREATE TABLE msgs(id INTEGER PRIMARY KEY, msg TEXT NOT NULL, \
 					 				   sender TEXT NOT NULL, recipient TEXT, \
-					 				   timestamp TEXT NOT NULL, sig TEXT NOT NULL, key TEXT);"
+					 				   timestamp TEXT NOT NULL, sig TEXT NOT NULL, key1 TEXT, key2 TEXT);"
 
 ui.o: ui.c ui.h api.h
 

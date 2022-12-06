@@ -149,16 +149,6 @@ int handle_register(struct client_state *state, struct api_msg *msg)   {
     if(sign_msg(msg) != 0)  {
         return -1;
     }
-    /* store certificate in message */
-    char *cert_path = get_cert_path(msg->sender);
-    if(!cert_path)  {
-        return -1;
-    }
-    msg->cert = get_cert(cert_path);
-    if(!msg->cert)  {
-        return -1;
-    }
-    printf("cert path = %s\n", cert_path);
     return api_send(state->ssl, state->api.fd, msg);
 }
 
@@ -269,16 +259,22 @@ int handle_private(struct client_state *state, struct api_msg *msg) {
     strcpy(msg->buffer, (char*) ciphertext);
     free(ciphertext);;
 
-    /* encrypt AES with RSA */
+    /* encrypt AES with recipient's key */
     unsigned char key_and_iv[AES_LEN + IV_LEN];
     memset(key_and_iv, '\0', AES_LEN + IV_LEN);
     strcat((char*)key_and_iv, (char*)aes->key);
     strcat((char*)key_and_iv, " ");
     strcat((char*)key_and_iv, (char*)aes->iv);
-    unsigned char *encrypted_aes = use_rsa(msg->sender, key_and_iv, 1);
-    memcpy(msg->aes, encrypted_aes, RSA_LEN-1);
-    msg->aes[RSA_LEN-1] = '\0';
-    free(encrypted_aes);
+    unsigned char *encrypted_aes1 = use_rsa(msg->recipient, key_and_iv, 1);
+    memcpy(msg->aes1, encrypted_aes1, RSA_LEN-1);
+    msg->aes1[RSA_LEN-1] = '\0';
+    free(encrypted_aes1);
+
+    /* encrypt AES with sender's key */
+    unsigned char *encrypted_aes2 = use_rsa(msg->sender, key_and_iv, 1);
+    memcpy(msg->aes2, encrypted_aes2, RSA_LEN-1);
+    msg->aes2[RSA_LEN-1] = '\0';
+    free(encrypted_aes2);
 
     if(sign_msg(msg) != 0)  {
         return -1;
@@ -346,11 +342,20 @@ static int client_process_command(struct client_state *state) {
     return ret;
 }
 
-int handle_incoming_privmsg(struct api_msg *msg)   {
+int handle_incoming_privmsg(const char *username, struct api_msg *msg)   {
     /* decrypt aes key */
-    unsigned char *decrypted_key = use_rsa(msg->sender, (unsigned char*) msg->aes, 0);
-    if(!decrypted_key)  {
-        return -1;
+    unsigned char *decrypted_key = NULL;
+    if(strcmp(msg->sender, username) == 0)  {
+        decrypted_key = use_rsa(msg->sender, (unsigned char*) msg->aes2, 0);
+        if(!decrypted_key)  {
+            return -1;
+        }
+    }
+    else    {
+        decrypted_key = use_rsa(msg->recipient, (unsigned char*) msg->aes1, 0);
+        if(!decrypted_key)  {
+            return -1;
+        }
     }
     decrypted_key[AES_LEN-1] = '\0';
     unsigned char *iv = decrypted_key + AES_LEN;
@@ -401,17 +406,17 @@ static int execute_request(struct client_state *state,
             message_user(AUTH_ERROR, NULL);
             return -1;
         default:
-            // todo refactor
             if(state->logged_in) {
-                if(verify_sig(msg) != 0)    {
-                    perror("invalid signature\n");
-                    return -1;
+                if(strcmp(msg->sender, state->ui.username) != 0)  {
+                    if(verify_sig(msg) != 0)    {
+                        return -1;
+                    }
                 }
                 if(msg->type == PUB_MSG)    {
                     message_user(PUB_MSG, msg);
                 }
                 else   {
-                    if(handle_incoming_privmsg(msg) != 0)   {
+                    if(handle_incoming_privmsg(state->ui.username, msg) != 0)   {
                         return -1;
                     }
                     message_user(PRIV_MSG, msg);

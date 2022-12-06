@@ -110,7 +110,7 @@ int insert_msg(const struct api_msg *msg) {
     }
     sqlite3_stmt *stmt;
 
-    const char *query = "INSERT INTO msgs (msg, sender, recipient, timestamp, sig, key) VALUES (?, ?, ?, ?, ?, ?);";
+    const char *query = "INSERT INTO msgs (msg, sender, recipient, timestamp, sig, key1, key2) VALUES (?, ?, ?, ?, ?, ?, ?);";
     if(sqlite3_prepare_v2(db, query, -1, &stmt, NULL) != SQLITE_OK || !stmt) {
         goto cleanup;
     }
@@ -129,7 +129,10 @@ int insert_msg(const struct api_msg *msg) {
     if(sqlite3_bind_text(stmt, 5, msg->sig, SIG_LEN-1, SQLITE_STATIC) != SQLITE_OK)   {
         goto cleanup;
     }
-    if(sqlite3_bind_text(stmt, 6, msg->aes, RSA_LEN-1, SQLITE_STATIC) != SQLITE_OK)   {
+    if(sqlite3_bind_text(stmt, 6, msg->aes1, RSA_LEN-1, SQLITE_STATIC) != SQLITE_OK)   {
+        goto cleanup;
+    }
+    if(sqlite3_bind_text(stmt, 7, msg->aes2, RSA_LEN-1, SQLITE_STATIC) != SQLITE_OK)   {
         goto cleanup;
     }
     int r = sqlite3_step(stmt);
@@ -148,7 +151,6 @@ int insert_msg(const struct api_msg *msg) {
 }
 
 int set_msg_fields(struct api_msg *msg, sqlite3_stmt *stmt)    {
-    msg->type = 0;
     if(!sqlite3_column_text(stmt, 0))   {
         return -1;
     }
@@ -156,7 +158,7 @@ int set_msg_fields(struct api_msg *msg, sqlite3_stmt *stmt)    {
     if(!sqlite3_column_text(stmt, 1))   {
         return -1;
     }
-    memcpy(msg->sender,  sqlite3_column_text(stmt, 1), USERNAME_LEN-1);
+    memcpy(msg->sender, sqlite3_column_text(stmt, 1), USERNAME_LEN-1);
     if(!sqlite3_column_text(stmt, 2))   {
         return -1;
     }
@@ -165,26 +167,26 @@ int set_msg_fields(struct api_msg *msg, sqlite3_stmt *stmt)    {
         return -1;
     }
     memcpy(msg->sig, sqlite3_column_text(stmt, 3), SIG_LEN-1);
-    unsigned const char *recipient = sqlite3_column_text(stmt, 4);
-    if(!recipient)   {
+    if(!sqlite3_column_text(stmt, 4))   {
         return -1;
-    }
-    /* public message */
-    if(recipient[0] == ' ') {
-        return 0;
     }
     memcpy(msg->recipient, sqlite3_column_text(stmt, 4), USERNAME_LEN-1);
     if(!sqlite3_column_text(stmt, 5))   {
         return -1;
     }
-    memcpy(msg->aes, sqlite3_column_text(stmt, 5), RSA_LEN-1);
-    if(strlen(msg->recipient) > 0 && strlen(msg->aes) > 0)   {
+    memcpy(msg->aes1, sqlite3_column_text(stmt, 5), RSA_LEN-1);
+    if(!sqlite3_column_text(stmt, 6))   {
+        return -1;
+    }
+    memcpy(msg->aes2, sqlite3_column_text(stmt, 6), RSA_LEN-1);
+    msg->type = 0;
+    if(strlen(msg->recipient) > 0 || msg->recipient[0] == ' ')   {
         msg->type = 4;
     }
     return 0;
 }
 
-struct api_msg** get_all_msgs(void)    {
+struct api_msg** get_all_msgs()    {
     if(open_db() != SQLITE_OK)  {
         return NULL;
     }
@@ -195,28 +197,28 @@ struct api_msg** get_all_msgs(void)    {
         return NULL;
     }
     sqlite3_stmt *stmt;
-    const char *query = "SELECT timestamp, sender, msg, sig, recipient, key FROM msgs ORDER BY id ASC;";
-    if(sqlite3_prepare_v2(db, query, -1, &stmt, NULL) != SQLITE_OK || !stmt) {
+    const char *query = "SELECT timestamp, sender, msg, sig, recipient, key1, key2 FROM msgs ORDER BY id ASC;";
+    int r = sqlite3_prepare_v2(db, query, -1, &stmt, NULL);
+    if(r != SQLITE_OK || !stmt) {
         goto cleanup;
     }
     unsigned long num_msgs = 0;
     while(sqlite3_step(stmt) != SQLITE_DONE)    {
         int num_cols = sqlite3_column_count(stmt);
-        for(int i = 0; i < num_cols; i+=6)  {
+        for(int i = 0; i < num_cols; i+=7)  {
             if(num_msgs >= capacity - 1)    {
                 capacity *= 2;
-                struct api_msg **temp = (struct api_msg**) realloc(msgs, capacity * msg_size);
-                if(!temp) {
+                msgs = (struct api_msg**) realloc(msgs, capacity * msg_size);
+                if(!msgs) {
                     goto cleanup;
                 }
-                msgs = temp;
             }
             struct api_msg *msg = calloc(1, sizeof(struct api_msg));
-            api_init_msg(msg);
-            msgs[num_msgs++] = msg;
-            if(set_msg_fields(msg, stmt) != 0)  {
+            int r = set_msg_fields(msg, stmt);
+            if(r != 0)  {
                 goto cleanup;
             }
+            msgs[num_msgs++] = msg;
         }
     }
     msgs[num_msgs] = NULL;
@@ -227,14 +229,10 @@ struct api_msg** get_all_msgs(void)    {
     return msgs;
 
     cleanup:
-        for(int i = 0; i < num_msgs; i++) {
-            free(msgs[i]);
-        }
         free(msgs);
         sqlite3_close(db);
         return NULL;
 }
-
 
 struct api_msg* get_last_msg(void) {
     if(open_db() != SQLITE_OK)  {
@@ -245,20 +243,22 @@ struct api_msg* get_last_msg(void) {
         return NULL;
     }
     sqlite3_stmt  *stmt;
-    const char *query = "SELECT timestamp, sender, msg, sig, recipient, key from msgs WHERE id = (SELECT MAX(ID) FROM msgs);";
+    const char *query = "SELECT timestamp, sender, msg, sig, recipient, key1, key2 from msgs "
+                        "WHERE id = (SELECT MAX(ID) FROM msgs);";
+    int r = sqlite3_prepare_v2(db, query, -1, &stmt, NULL);
 
-    if(sqlite3_prepare_v2(db, query, -1, &stmt, NULL) != SQLITE_OK || !stmt)  {
+    if(r != SQLITE_OK || !stmt)  {
         goto cleanup;
     }
-    int r = sqlite3_step(stmt);
+    r = sqlite3_step(stmt);
     if(r != SQLITE_ROW)    {
         goto cleanup;
     }
-    if(set_msg_fields(msg, stmt) != 0)  {
+    r = set_msg_fields(msg, stmt);
+    if(r != 0)  {
         goto cleanup;
     }
-    r = sqlite3_finalize(stmt);
-    if(r != SQLITE_OK)  {
+    if(sqlite3_finalize(stmt) != SQLITE_OK)  {
         goto cleanup;
     }
     sqlite3_close(db);
@@ -310,7 +310,7 @@ int update_online(const char *username, const int active)   {
         return -1;
 }
 
-struct api_msg *get_online_users(void)  {
+struct api_msg *get_online_users()  {
     if(open_db() != SQLITE_OK)  {
         return NULL;
     }
