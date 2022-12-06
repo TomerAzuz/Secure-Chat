@@ -11,14 +11,17 @@ The server calls `fork` for each incoming connection, thereby allowing to servic
   * The client and the server use the `api_msg` struct to store the data about the message.
   * Before sending the message with its metadata, the sender sends the size of the message (and its metadata), so that the receiver knows how much data is expected to be read.
   * The data about the message contains the following fields:
-    * A buffer to store the message.
-    * The type of the message.
-    * The username associated with the client (if applicable).
-    * The password associated with the client (if applicable).
-    * The timestamp of the message (if applicable).
-  * At the receiver end, the message is parsed and processed according to its type.
+    * A buffer to store the message (a private message is sent encrypted)
+    * The type of the message
+    * The sender associated with the client
+    * The (hashed) password associated with the client (if applicable)
+    * The timestamp of the message (if applicable)
+    * The client's public key (for registration only)
+    * The recipient's sender (for private messages only)
+    * Encrypted AES key (for private messages only)
+  * At the receiver's end, the message is parsed and processed according to its type.
 * Whenever an incoming message from the client is received by the worker, all other workers are notified and the message is forwarded to their clients. 
-* The client (as for assignment 1a) prints any incoming message sent by the server (`execute request()`).
+* The client executes any incoming message sent by the server according to its type (`execute request()`).
 * The server interacts with the database using the functions in `database.c`.
   * The server can request the last public message sent (`get_last_pubmsg()`), and all the messages stored in the database (`get_all_msgs()`).
   * The server can also store messages  and accounts in the database (`insert_msg()` and (`store_account()`).
@@ -26,8 +29,8 @@ The server calls `fork` for each incoming connection, thereby allowing to servic
 ### Message Format
 * public message:&nbsp;&nbsp;&nbsp; "message"
 * private message:&nbsp; @recipient "message"
-* register: &ensp;&emsp;&ensp;&emsp;&ensp;&ensp; /register username password
-* login: &emsp;&emsp;&emsp;&emsp;&emsp;&nbsp;&nbsp;/login username password
+* register: &ensp;&emsp;&ensp;&emsp;&ensp;&ensp; /register sender password
+* login: &emsp;&emsp;&emsp;&emsp;&emsp;&nbsp;&nbsp;/login sender password
 * online users:&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; /users
 * exit:  &emsp;&emsp;&emsp;&emsp;&ensp;&emsp;&nbsp; /exit
 
@@ -52,3 +55,109 @@ The functions in `parser.c` are used to determine the message type, as well as s
 In case an invalid input is read, the type of the message is set to invalid and the input is discarded by the client. <br>
 
 
+## Cryptography
+
+### Client and Server Interaction
+An SSL connection ensures that any data sent over the socket is encrypted. <br>
+Therefore, all communication between the server and the client is protected from eavesdrppers. <br>
+In addition, the sender signs messages with his private key to ensure non-repudiation, as well as the integrity and authenticity of the message. <br>
+The receiver then verifies the signature using the sender's public key. <br>
+Furthermore, clients authenticate the server upon establishing a connection by checking the server's certificate.
+
+#### Registration
+The client receives the command and its arguments from `stdin`. <br>
+The client sends the message to the server with a hashed password. In that manner, the plaintext password remains invisible to the server. <br>
+Additionally, the client uses the TTP to generate a public and a private key, and sends the public key to the server over the socket which will be used to verify the client's signature. <br>
+To prevent rainbow table attacks, the server generates salt and concatenates it to the hashed password received from the client and hashes the resulted string. <br>
+The account of the user is then stored in the database in the following way:
+* Username in plaintext
+* Hash salted password
+* The salt of the password in plaintext 
+* The client's public key
+
+The following format describes a registration command sent by the client to the server: <br>
+`/register sender hashed_password public_key signature` <br>
+The server's response may indicate either a successful or unsuccessful registeration, which is sent to the client in plaintext over the socket. <br>
+
+#### Logging in
+The client receives the command and its arguments from `stdin`. <br>
+The client performs the same procedure as for registration, except that now the public key is already stored in the database, and hence does not need to be sent over the socket. <br>
+The server verifies the signature, retrieves the salt from the database and concatenates it to the password received from the client. 
+The resulted string is hashed and compared to the password stored in the database. <br>
+The following format describes a login command sent by the client to the server:<br>
+`/login sender hashed_password signature` <br>
+Similar to registration, the server responds with either successful or unsuccessful login sent in plaintext over the socket. <br>
+
+#### Public Messages
+The client receives the message from `stdin`, signs the message with his private key and sends it to the server. <br>
+The server verifies the signature, stores the message in the database and notifies all other workers. <br>
+The following information about public messages is stored in the database:
+* The message in plaintext
+* The sender's sender
+* The timestamp of the message
+
+The following format describes a public message sent by the client to the server:<br>
+`"some message" signature`
+
+#### Private Messages
+The client receives a private message command from `stdin` followed by the recipient's sender and the message. <br>
+The client does the following before sending the message over the socket:
+* Uses the TTP to generates a symmetric (AES) key
+* Encrypts the plaintext message with the AES key
+* Encrypts the AES key with the recipient's public key
+* Signs the message
+
+The following format describes a private message sent by the client to the server:<br>
+`"some message" AES_key (encrypted with the recipient's public key) signature` <br>
+
+The following information about private messages is stored in the database:
+* The message in ciphertext
+* The sender's sender 
+* The recipient's sender
+* The timestamp of the message
+* The encrypted AES key
+
+To decrypt the message, the AES key is decrypted using the recipient's private key, and the ciphertext is then decrypted using the AES key. The process is repeated for every private message. <br>
+#### Users Command
+The client receives the `users` command from `stdin` signs and sends it over the socket. <br>
+The following format describes a `users` command sent by the client to the server: <br>
+`/users signature` <br>
+The server replies with a list of online users.
+#### Exit Command
+The client receives the `exit` command from `stdin` and disconnects from the server. <br>
+Cryptography is not applied for the `exit` command. <br>
+
+### Key Distribution
+Initially, the TTP generates certificates and keys for the server and for itself. <br>
+Clients have their certificates and keys generated by the TTP upon successful registration. <br>
+The TTP is provided with the least amount of information necessary to generate certificates and keys and is not involved in the interaction between the client and the server. <br>
+The sender for which the keys and certificates are issued is the only information shared with the TTP.  
+In addition, the TTP is authorized to access the server's and clients' keys directories. <br>
+The TTP is also used for generating AES keys for private messages. <br>
+
+### Security Requirements
+* **Mallory cannot get information about private messages for which she is not either the sender or the intended recipient.**
+  * Private messages are sent encrypted with a one-time AES key on an SSL connection, thereby protecting confidentiality. <br>
+    Additionally, private messages are stored as ciphertext in the database, ensuring that the messages remain confidential even if the server is compromised.
+* **Mallory cannot send messages on behalf of another user.**
+  * Public and private messages are signed by the sender. Since the sender's private key is required for signing the message, 
+    a valid signature provides a proof of the sender's identity. Messages with an invalid signature should not be processed. 
+* **Mallory cannot modify messages sent by other users.**
+  * Signing a message requires to hash the message and encrypt the result with the private key. The recipient decrypts the message with the sender's public key and checks whether the hashes are equal.
+    Any modification to the original message will result in a different hash, thereby resulting in an invalid signature.
+* **Mallory cannot find out users’ passwords, private keys, or private messages (even if the server is compromised).**
+  * Passwords are hashed before being sent from the client to the server. The server applies salt and hash before storing the passwords in the database.  <br>
+    Private keys are stored locally and therefore a compromised server does not result in compromised private keys. <br>
+    Private messages are sent and stored encrypted in the database and therefore are not disclosed to Mallory. <br>
+* **Mallory cannot use the client or server programs to achieve privilege escalation on the systems they are running on.**
+  *  The client and server should operate with the least privileges necessary. Additionally, the use of prepared statements reduces the risk of SQL injections.
+* **Mallory cannot leak or corrupt data in the client or server programs.**
+  *  Early validation of input, as well as escaping, sanitization and prepared statements aim to reduce the risk of data leak and corruption. 
+* **Mallory cannot crash the client or server programs.**
+  *  Sanitization, escaping and early validation of input can reduce the risk of crashing the client and server programs. 
+     However, this cannot be guaranteed as program crashes can occur due to hardware or network failures. 
+* **The programs must never expose any information from the systems they run on, beyond what is required for the program to meet the requirements in the assignments.**
+  * Error messages displayed to the user should not contain any information that can be used to attack the program. 
+* **The programs must be unable to modify any files except for chat.db and the contents of the clientkeys and clientkeys directories, or any operating system settings, even if Mallory attempts to force it to do so.**
+  * By applying the principle of least privilege, the client and the server programs will only have access to their respective key directories.
+    Early validation and escaping reduce the risk of unauthorized accesses. 

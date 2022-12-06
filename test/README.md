@@ -32,13 +32,13 @@
 #### Predefined messages: all predefined messages are explained bellow.
 ##### 
 ##### "registration succeeded" should be outputed standalone on a newline if the 
-#####  user successfully registers with a @username and @password.
+#####  user successfully registers with a @sender and @password.
 ##### 
 ##### "error: user erik already exists" should be outputed standalone on a newline 
 #####  if we cannot register user @erik as he was already registered.
 ##### 
 ##### "authentication succeeded" should be outputed standalone on a newline if the 
-#####  user successfully logins with a @username and @password.
+#####  user successfully logins with a @sender and @password.
 ##### 
 ##### "error: invalid credentials" should be outputed standalone on a newline if the 
 #####  user cannot login due to invalid credentials.

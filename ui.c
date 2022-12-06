@@ -1,6 +1,5 @@
 #include <assert.h>
 #include <stdio.h>
-#include <string.h>
 
 #include "ui.h"
 #include "api.h"
@@ -23,7 +22,7 @@ void ui_state_init(struct ui_state *state) {
     assert(state);
 }
 
-void message_user(int msg_type, const char *msg)    {
+void message_user(int msg_type, const struct api_msg *msg)    {
     switch (msg_type) {
         case INVALID_CMD:
             fprintf(stdout, "error: command not currently available\n");
@@ -32,7 +31,16 @@ void message_user(int msg_type, const char *msg)    {
             fprintf(stdout, "error: invalid command format\n");
             break;
         case UNKNOWN_CMD:
-            fprintf(stdout, "error: unknown command %s\n", msg);
+            fprintf(stdout, "error: unknown command %s\n", msg->buffer);
+            break;
+        case AUTH_ERROR:
+            fprintf(stdout, "error: invalid credentials\n");
+            break;
+        case USERNAME_TAKEN:
+            fprintf(stdout, "error: user %s already exists\n", msg->sender);
+            break;
+        case USER_NOT_FOUND:
+            fprintf(stdout, "error: user not found\n");
             break;
         case REGISTER:
             fprintf(stdout, "registration succeeded\n");
@@ -40,13 +48,18 @@ void message_user(int msg_type, const char *msg)    {
         case LOGIN:
             fprintf(stdout, "authentication succeeded\n");
             break;
+        case USERS:
+            fprintf(stdout, "%s\n", msg->buffer);
+            break;
+        case PRIV_MSG:
+            fprintf(stdout, "%s %s: @%s %s\n", msg->timestamp, msg->sender, msg->recipient, msg->buffer);
+            break;
         default:
-            fprintf(stdout, "%s\n", msg);
+            fprintf(stdout,"%s %s: %s\n", msg->timestamp, msg->sender, msg->buffer);
     }
 }
 
 int read_input(char *buf) {
-    int ret = fgets(buf, BUFFER_LEN - 1, stdin) ? 1 : 0;
-    buf[strlen(buf)] = '\0';
-    return ret;
+    char *input = fgets(buf, BUFFER_LEN, stdin);
+    return input ? 1 : 0;
 }

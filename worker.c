@@ -4,37 +4,54 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <openssl/err.h>
+#include <openssl/ssl.h>
 
 #include "api.h"
 #include "util.h"
 #include "worker.h"
 #include "parser.h"
 #include "database.h"
+#include "ssl-nonblock.h"
+#include "crypto.h"
 
 struct worker_state {
+    SSL *ssl;
     struct api_state api;
     int eof;
     int server_fd;  /* server <-> worker bidirectional notification channel */
     int server_eof;
     char username[USERNAME_LEN];
+    int logged_in;
 };
 
+int is_privmsg_for_me(const char *username, struct api_msg *msg) {
+    if(msg->type != PRIV_MSG) {
+        return PUB_MSG;
+    }
+    if((strncmp(username, msg->sender, USERNAME_LEN-1) == 0) ||
+       (strncmp(username, msg->recipient, USERNAME_LEN-1) == 0)) {
+        return 1;
+    }
+    return -1;
+}
 /**
  * @brief Reads an incoming notification from the server and notifies
  *        the client.
  */
 static int handle_s2w_notification(struct worker_state *state) {
     assert(state);
-    char *pubmsg = get_last_pubmsg();
-    size_t msg_size = strlen(pubmsg);
-    size_t ret = send(state->api.fd, &msg_size, sizeof(size_t), 0);
-    if(ret <= 0)    {
-        free(pubmsg);
+    struct api_msg *msg = get_last_msg();
+    if(!msg)    {
         return -1;
     }
-    ret = send(state->api.fd, pubmsg, msg_size, 0);
-    free(pubmsg);
-    return ret <= 0 ? -1 : 0;
+    if(is_privmsg_for_me(state->username, msg) < 0)  {
+        free(msg);
+        return 0;
+    }
+    int ret = api_send(state->ssl, state->api.fd, msg);
+    free(msg);
+    return ret;
 }
 
 /**
@@ -42,8 +59,6 @@ static int handle_s2w_notification(struct worker_state *state) {
  *                from the client.
  * @param state   Initialized worker state
  */
-/* TODO call this function to notify other workers through server */
-__attribute__((unused))
 static int notify_workers(struct worker_state *state) {
     char buf = 0;
     ssize_t r;
@@ -58,70 +73,139 @@ static int notify_workers(struct worker_state *state) {
     }
     return 0;
 }
-/**
- * @brief retrieve all message from the database
- * @param state
- * @return 0 on success, -1 otherwise
- */
+
 int send_all_msgs(struct worker_state *state) {
     assert(state);
-    ssize_t r;
-    char *all_msgs = get_all_msgs();
-    size_t msgs_size = strlen(all_msgs);
-    r = send(state->api.fd, &msgs_size, sizeof(size_t), 0);
-    if(r < 0)  {
-        goto cleanup;
+    struct api_msg **all_msgs = get_all_msgs();
+    if(!all_msgs)   {
+        return -1;
     }
-    r = send(state->api.fd, all_msgs, msgs_size, 0);
-    if(r < 0)  {
-        goto cleanup;
+    int num_msgs = 0;
+    int r;
+
+    /* count messages */
+    while(all_msgs[num_msgs++]);
+
+    for(int i = 0; i < num_msgs-1; i++)   {
+        if(is_privmsg_for_me(state->username, all_msgs[i]) < 0)  {
+            continue;
+        }
+        r = api_send(state->ssl, state->api.fd, all_msgs[i]);
+        if(r < 0)  {
+            goto cleanup;
+        }
+    }
+    for(int i = 0; i < num_msgs-1; i++) {
+        free(all_msgs[i]);
     }
     free(all_msgs);
     return 0;
 
     cleanup:
-        free(all_msgs);
+    for(int i = 0; i < num_msgs-1; i++) {
+        free(all_msgs[i]);
+    }
+    free(all_msgs);
+    return -1;
+}
+
+int handle_register(struct worker_state *state, struct api_msg *msg)  {
+    assert(state);
+    assert(msg);
+    strncpy(state->username, msg->sender, USERNAME_LEN-1);
+    //EVP_PKEY *pubkey = X509_get0_pubkey(cacert);
+    char *salt = (char*) generate_salt();
+    if(!salt)   {
         return -1;
-}
-
-int handle_register(struct worker_state *state, const struct api_msg *msg)  {
-    assert(state);
-    assert(msg);
-
-    strcpy(state->username, msg->username);
-    int r = store_account(state->username, msg->pwd);
-    if(r != 0)  return -1;
-    r = send_all_msgs(state);
-    if(r != 0)  return -1;
+    }
+    if(salt_hash_pwd(msg->pwd, salt) != 0)  {
+        goto cleanup;
+    }
+    if(store_account(state->username, msg->pwd, salt) != 0) {
+        goto cleanup;
+    }
+    if(send_msg_status(state->ssl, state->api.fd, REGISTER, NULL) != 0)  {
+        goto cleanup;
+    }
+    if(send_all_msgs(state) != 0) {
+        goto cleanup;
+    }
+    state->logged_in = 1;
     return 0;
-}
 
-int handle_login(struct worker_state *state, const struct api_msg *msg)  {
-    assert(state);
-    assert(msg);
-
-    strcpy(state->username, msg->username);
-    int r = send_all_msgs(state);
-    if(r != 0)  return -1;
-    return 0;
-}
-
-int handle_users()  {
-    // TODO
+    cleanup:
+    free(salt);
     return -1;
 }
 
-int handle_private()   {
-    // TODO
-    return -1;
+int auth_user(struct api_msg *msg) {
+    /* get salt from db */
+    char *salt = get_salt(msg->sender);
+    if(!salt)   {
+        return -1;
+    }
+    /* salt hash password from user */
+    if(salt_hash_pwd(msg->pwd, salt) != 0)   {
+        free(salt);
+        return -1;
+    }
+    /* get password from db */
+    char *pwd = get_pwd(msg->sender);
+    if(!pwd)    {
+        free(salt);
+        return -1;
+    }
+    if(strncmp(pwd, msg->pwd, PWD_LEN-1) != 0)   {
+        free(salt);
+        free(pwd);
+        return -1;
+    }
+
+    free(salt);
+    free(pwd);
+    return 0;
 }
 
-int handle_public(struct worker_state *state,
-                 const struct api_msg *msg)    {
+int handle_login(struct worker_state *state, struct api_msg *msg)  {
+    assert(state);
+    assert(msg);
+    strncpy(state->username, msg->sender, USERNAME_LEN-1);
+    int r;
+    if(auth_user(msg) != 0)    {
+        r = send_msg_status(state->ssl, state->api.fd, AUTH_ERROR, msg->sender);
+        return r < 0 ? r : 0;
+    }
+    else    {
+        r = send_msg_status(state->ssl, state->api.fd, LOGIN, NULL);
+        if(r != 0) return -1;
+    }
+    if(update_online(msg->sender, 1) != 1)  {
+        return -1;
+    }
+    state->logged_in = 1;
+    return send_all_msgs(state);
+}
+
+int handle_users(struct worker_state *state)  {
+    struct api_msg *online_users = get_online_users();
+    if(!online_users) {
+        return -1;
+    }
+    online_users->type = USERS;
+    if(api_send(state->ssl, state->api.fd, online_users) != 0)  {
+        free(online_users);
+        return -1;
+    }
+    free(online_users);
+    return 0;
+}
+
+int handle_msg(struct worker_state *state,
+                  const struct api_msg *msg)    {
     assert(state);
     assert(msg);
 
-    int r = insert_msg(msg->buffer, msg->username, msg->timestamp);
+    int r = insert_msg(msg);
     if(r < 0) return -1;
     r = notify_workers(state);
     return r;
@@ -133,7 +217,7 @@ int handle_public(struct worker_state *state,
  * @param msg     Message to handle
  */
 static int execute_request(struct worker_state *state,
-                           const struct api_msg *msg) {
+                           struct api_msg *msg) {
     assert(state);
     assert(msg);
     if(!state->server_eof)  {
@@ -143,11 +227,9 @@ static int execute_request(struct worker_state *state,
             case LOGIN:
                 return handle_login(state, msg);
             case USERS:
-                return handle_users();
-            case PRIV_MSG:
-                return handle_private();
+                return handle_users(state);
             default:
-                return handle_public(state, msg);
+                return handle_msg(state, msg);
         }
     }
     return 0;
@@ -163,7 +245,7 @@ static int handle_client_request(struct worker_state *state) {
 
     assert(state);
     /* wait for incoming request, set eof if there are no more requests */
-    r = api_recv(&state->api, &msg);
+    r = api_recv(state->ssl, &state->api, &msg);
     if (r < 0) {
         return -1;
     }
@@ -236,11 +318,7 @@ static int handle_incoming(struct worker_state *state) {
         return -1;
     }
 
-    /* handle ready file descriptors */
-    /* TODO once you implement encryption you may need to call ssl_has_data
-     * here due to buffering (see ssl-nonblock example)
-     */
-    if (FD_ISSET(state->api.fd, &readfds)) {
+    if (FD_ISSET(state->api.fd, &readfds) && ssl_has_data(state->ssl)) {
         if (handle_client_request(state) != 0) success = 0;
     }
     if (FD_ISSET(state->server_fd, &readfds)) {
@@ -265,9 +343,11 @@ static int worker_state_init(
     /* initialize */
     memset(state, 0, sizeof(*state));
     state->server_fd = server_fd;
-
+    memset(state->username, '\0', USERNAME_LEN);
     /* set up API state */
     api_state_init(&state->api, connfd);
+
+    state->logged_in = 0;
     return 0;
 }
 
@@ -278,12 +358,17 @@ static int worker_state_init(
  */
 static void worker_state_free(struct worker_state *state) {
 
+    if(state->logged_in)    {
+        update_online(state->username, 0);
+    }
     /* clean up API state */
     api_state_free(&state->api);
 
     /* close file descriptors */
     close(state->server_fd);
     close(state->api.fd);
+
+    SSL_free(state->ssl);
 }
 
 /**
@@ -298,7 +383,8 @@ static void worker_state_free(struct worker_state *state) {
 __attribute__((noreturn))
 void worker_start(
         int connfd,
-        int server_fd) {
+        int server_fd,
+        SSL *ssl) {
     struct worker_state state;
     int success = 1;
 
@@ -306,7 +392,7 @@ void worker_start(
     if (worker_state_init(&state, connfd, server_fd) != 0) {
         goto cleanup;
     }
-    /* TODO any additional worker initialization */
+    state.ssl = ssl;
 
     /* handle for incoming requests */
     while (!state.eof) {

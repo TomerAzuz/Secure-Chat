@@ -10,10 +10,12 @@
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <openssl/err.h>
+#include <openssl/ssl.h>
 
 #include "util.h"
 #include "worker.h"
-#include "database.h"
+#include "ssl-nonblock.h"
 
 #define MAX_CHILDREN 16
 
@@ -26,7 +28,52 @@ struct server_state {
   int sockfd;
   struct server_child_state children[MAX_CHILDREN];
   int child_count;
+  SSL *ssl;
 };
+
+int ssl_accept(struct server_state *state, SSL_CTX *ctx, int connfd)    {
+    state->ssl = SSL_new(ctx);
+    if(!state->ssl)    {
+        SSL_CTX_free(ctx);
+        return -1;
+    }
+    if(SSL_set_fd(state->ssl, connfd) != 1)  {
+        goto cleanup;
+    }
+    if(ssl_block_accept(state->ssl, connfd) != 1)    {
+        goto cleanup;
+    }
+    return 0;
+
+    cleanup:
+        SSL_CTX_free(ctx);
+        SSL_free(state->ssl);
+        return -1;
+}
+
+
+int setup_ssl(struct server_state *state, int connfd)  {
+    SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+    if(!ctx)    {
+        return -1;
+    }
+    const char cert_path[] = "./keys/serverkeys/server-cert.pem";
+    if(SSL_CTX_use_certificate_file(ctx, cert_path, SSL_FILETYPE_PEM) <= 0)  {
+        goto cleanup;
+    }
+    const char key_path[] = "./keys/serverkeys/keypriv.pem";
+    if(SSL_CTX_use_PrivateKey_file(ctx, key_path, SSL_FILETYPE_PEM) <= 0)   {
+        goto cleanup;
+    }
+    if(set_nonblock(state->sockfd) != 0)    {
+        goto cleanup;
+    }
+    return ssl_accept(state, ctx, connfd);
+
+    cleanup:
+        SSL_CTX_free(ctx);
+        return -1;
+}
 
 static int create_server_socket(uint16_t port) {
   int fd;
@@ -53,7 +100,6 @@ static int create_server_socket(uint16_t port) {
     perror("error: cannot listen on server socket");
     goto error;
   }
-
   return fd;
 
 error:
@@ -128,61 +174,66 @@ static void close_server_handles(struct server_state *state) {
 }
 
 static int handle_connection(struct server_state *state) {
-  struct sockaddr addr;
-  socklen_t addrlen = sizeof(addr);
-  int connfd;
-  pid_t pid;
-  int sockets[2];
+    struct sockaddr addr;
+    socklen_t addrlen = sizeof(addr);
+    int connfd;
+    pid_t pid;
+    int sockets[2];
 
-  assert(state);
+    assert(state);
 
-  /* accept incoming connection */
-  connfd = accept(state->sockfd, &addr, &addrlen);
-  if (connfd < 0) {
-    if (errno == EINTR) return 0;
-    perror("error: accepting new connection failed");
-    return -1;
-  }
+    /* accept incoming connection */
+    connfd = accept(state->sockfd, &addr, &addrlen);
+    if (connfd < 0) {
+        if (errno == EINTR) return 0;
+        perror("error: accepting new connection failed");
+        return -1;
+    }
 
-  /* can we support more children? */
-  if (state->child_count >= MAX_CHILDREN) {
-    fprintf(stderr,
+    /* can we support more children? */
+    if (state->child_count >= MAX_CHILDREN) {
+        fprintf(stderr,
       "error: max children exceeded, dropping incoming connection\n");
-    return 0;
-  }
+        return 0;
+    }
 
-  /* prepare notification channel */
-  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) < 0) {
-    perror("error: opening stream socket pair");
-    return -1;
-  }
+    if(setup_ssl(state, connfd) != 0)   {
+        perror("ssl setup failed\n");
+        return -1;
+    }
 
-  /* fork process to handle it */
-  pid = fork();
-  if (pid == 0) {
-    /* worker process */
-    close(sockets[0]);
-    close_server_handles(state);
-    worker_start(connfd, sockets[1]);
-    /* never reached */
-    exit(1);
-  }
-  if (pid == -1) {
-    perror("error: cannot fork");
+    /* prepare notification channel */
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) < 0) {
+        perror("error: opening stream socket pair");
+        return -1;
+    }
+
+    /* fork process to handle it */
+    pid = fork();
+    if (pid == 0) {
+        /* worker process */
+        close(sockets[0]);
+        close_server_handles(state);
+        worker_start(connfd, sockets[1], state->ssl);
+        /* never reached */
+        exit(1);
+    }
+    if (pid == -1) {
+        perror("error: cannot fork");
+        close(connfd);
+        close(sockets[0]);
+        close(sockets[1]);
+        return -1;
+    }
+
+    /* register child */
+    child_add(state, sockets[0]);
+
+    /* close worker handles in server process */
     close(connfd);
-    close(sockets[0]);
     close(sockets[1]);
-    return -1;
-  }
 
-  /* register child */
-  child_add(state, sockets[0]);
-
-  /* close worker handles in server process */
-  close(connfd);
-  close(sockets[1]);
-
-  return 0;
+    return 0;
 }
 
 static int handle_s2w_closed(struct server_state *state, int index) {
@@ -280,19 +331,19 @@ static int server_state_init(struct server_state *state) {
     state->children[i].worker_fd = -1;
   }
 
-  /* TODO any additional server state initialization */
+  state->ssl = NULL;
 
   return 0;
 }
 
 static void server_state_free(struct server_state *state) {
-  int i;
+    int i;
 
-  /* TODO any additional server state cleanup */
+    for (i = 0; i < MAX_CHILDREN; i++) {
+        close(state->children[i].worker_fd);
+    }
 
-  for (i = 0; i < MAX_CHILDREN; i++) {
-    close(state->children[i].worker_fd);
-  }
+    SSL_free(state->ssl);
 }
 
 static int handle_incoming(struct server_state *state) {

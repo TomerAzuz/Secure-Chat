@@ -4,19 +4,89 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#include <openssl/x509v3.h>
 
 #include "api.h"
 #include "ui.h"
 #include "util.h"
 #include "parser.h"
 #include "sanitizer.h"
+#include "ssl-nonblock.h"
+#include "crypto.h"
 
 struct client_state {
     struct api_state api;
     int eof;
     struct ui_state ui;
     int logged_in;
+    SSL *ssl;
 };
+
+int auth_server(struct client_state *state)   {
+    /* check server certificate */
+    if(!SSL_get_peer_certificate(state->ssl))    {
+        return -1;
+    }
+    if(SSL_get_verify_result(state->ssl) != X509_V_OK)  {
+        return -1;
+    }
+    /* verify hostname */
+    X509_VERIFY_PARAM *param = SSL_get0_param(state->ssl);
+    if(!param) {
+        return -1;
+    }
+    const char servername[] = "server.example.com/";
+    X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+    if (!X509_VERIFY_PARAM_set1_host(param, servername, sizeof(servername) - 1)) {
+        return -1;
+    }
+    return 0;
+}
+
+int ssl_connect(struct client_state *state, SSL_CTX *ctx)   {
+    state->ssl = SSL_new(ctx);
+    if(!state->ssl) {
+        SSL_CTX_free(ctx);
+        return -1;
+    }
+    SSL_set_verify(state->ssl, SSL_VERIFY_PEER, NULL);
+
+    if(set_nonblock(state->api.fd) != 0)    {
+        return -1;
+    }
+    if(SSL_set_fd(state->ssl, state->api.fd) != 1)  {
+        return -1;
+    }
+    if(ssl_block_connect(state->ssl, state->api.fd) != 1)  {
+        return -1;
+    }
+    return auth_server(state);
+}
+
+
+int setup_ssl(struct client_state *state) {
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if(!ctx)  {
+        return -1;
+    }
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+    const char ca_cert[] = "./keys/clientkeys/ca-cert.pem";
+    if(SSL_CTX_load_verify_locations(ctx, ca_cert, NULL) != 1)    {
+        SSL_CTX_free(ctx);
+        return -1;
+    }
+    if(ssl_connect(state, ctx) != 0) {
+        goto cleanup;
+    }
+    return 0;
+
+    cleanup:
+    SSL_CTX_free(ctx);
+    SSL_free(state->ssl);
+    return -1;
+}
 
 /**
  * @brief Connects to @hostname on port @port and returns the
@@ -48,122 +118,206 @@ static int client_connect(struct client_state *state,
         close(fd);
         return -1;
     }
-
     return fd;
 }
-/**
- * @param state
- * @param login
- * @return 0 if user is not logged in and sends unauthorized commands, 1 otherwise
- */
-int is_logged_in(struct client_state *state, int login)   {
-    assert(state);
-    if(state->logged_in != login)    {
-        message_user(INVALID_CMD, NULL);
-        return 0;
-    }
-    return 1;
-}
 
-int send_msg_to_worker(struct client_state *state, struct api_msg *msg) {
-    assert(state);
-    assert(msg);
-
-    /* send the size of the message */
-    size_t msg_size = sizeof(struct api_msg);
-    ssize_t ret = send(state->api.fd, &msg_size, sizeof(size_t), 0);
-    if(ret <= 0) {
+int username_exists(const char *username)    {
+    char *path = get_key_path(username, "keypub");
+    if(!path)  {
         return -1;
     }
-    /* send the message */
-    ret = send(state->api.fd, msg, msg_size, 0);
-    if(ret <= 0) {
-        return -1;
-    }
-    return 0;
+    return access(path, R_OK) == 0 ? 1 : 0;
 }
 
 int handle_register(struct client_state *state, struct api_msg *msg)   {
     assert(state);
     assert(msg);
-
-    state->logged_in = 1;
-    message_user(REGISTER, NULL);
-    memcpy(state->ui.username, msg->username, USERNAME_LEN);
-    return send_msg_to_worker(state, msg);
+    memcpy(state->ui.username, msg->sender, USERNAME_LEN);
+    if(username_exists(msg->sender))   {
+        message_user(USERNAME_TAKEN, msg);
+        return 0;
+    }
+    /* generate rsa key pair */
+    if(generate_rsa_keys(msg->sender) != 0)   {
+        return -1;
+    }
+    /* hash password */
+    if(hash_pwd(msg->pwd) != 0)    {
+        return -1;
+    }
+    /* sign message */
+    if(sign_msg(msg) != 0)  {
+        return -1;
+    }
+    /* store certificate in message */
+    char *cert_path = get_cert_path(msg->sender);
+    if(!cert_path)  {
+        return -1;
+    }
+    msg->cert = get_cert(cert_path);
+    if(!msg->cert)  {
+        return -1;
+    }
+    printf("cert path = %s\n", cert_path);
+    return api_send(state->ssl, state->api.fd, msg);
 }
 
 int handle_login(struct client_state *state, struct api_msg *msg)  {
     assert(state);
     assert(msg);
+    memcpy(state->ui.username, msg->sender, USERNAME_LEN);
 
-    state->logged_in = 1;
-    message_user(LOGIN, NULL);
-    memcpy(state->ui.username, msg->username, USERNAME_LEN);
-    return send_msg_to_worker(state, msg);
+    if(!username_exists(msg->sender))   {
+        message_user(AUTH_ERROR, NULL);
+        return -1;
+    }
+    if(hash_pwd(msg->pwd) != 0) {
+        return -1;
+    }
+    if(sign_msg(msg) != 0)  {
+        return -1;
+    }
+    return api_send(state->ssl, state->api.fd, msg);
 }
 
-int handle_users()  {
-    // TODO
-    return -1;
+int handle_users(struct client_state *state, struct api_msg *msg)  {
+    assert(msg);
+    msg->type = USERS;
+    memcpy(msg->sender, state->ui.username, USERNAME_LEN);
+    if(sign_msg(msg) != 0)  {
+        return -1;
+    }
+    return api_send(state->ssl, state->api.fd, msg);
 }
+
 
 int handle_public(struct client_state *state, struct api_msg *msg) {
     assert(state);
     assert(msg);
+    if(is_valid_msg(msg->buffer))   {
+        msg->type = PUB_MSG;
+        /* store timestamp in message */
+        char *timestamp = get_timestamp();
+        memcpy(msg->timestamp, timestamp, TIMESTAMP_LEN);
+        free(timestamp);
 
-    /* store timestamp in message */
-    char *timestamp = get_timestamp();
-    memcpy(msg->timestamp, timestamp, TIMESTAMP_LEN);
-    free(timestamp);
+        /* store sender */
+        strcpy(msg->sender, state->ui.username);
 
-    /* store username */
-    strcpy(msg->username, state->ui.username);
-
-    /* remove whitespace from message */
-    char* trimmed = remove_whitespace(msg->buffer);
-    memcpy(msg->buffer, trimmed, strlen(trimmed));
-
-    return send_msg_to_worker(state, msg);
+        /* sign message */
+        if(sign_msg(msg) != 0)  {
+            return -1;
+        }
+        return api_send(state->ssl, state->api.fd, msg);
+    }
+    message_user(INVALID_FORMAT, NULL);
+    return 0;
 }
 
 int handle_private(struct client_state *state, struct api_msg *msg) {
     assert(state);
     assert(msg);
 
-    char *buf = msg->buffer;
-    /* skip recipient */
+    msg->type = PRIV_MSG;
+    /* store recipient */
     int count = 0;
-    while(*buf != ' ')  {
+    char *buf = msg->buffer;
+    while(*buf != ' ' && count < USERNAME_LEN)  {
         count++;
         buf++;
+        msg->recipient[count-1] = *buf;
+    }
+    msg->recipient[count-1] = '\0';
+    if(!is_valid_username(msg->recipient))  {
+        printf("invalid username\n");
+        return 0;
+    }
+    if(!username_exists(msg->recipient))    {
+        message_user(USER_NOT_FOUND, NULL);
+        return 0;
     }
 
+    /* remove whitespace */
     char *trimmed = remove_whitespace(buf);
+    if(!is_valid_msg(trimmed))  {
+        message_user(INVALID_FORMAT, NULL);
+        return 0;
+    }
     buf -= count;
     buf = strtok(buf, " ");
 
-    char priv_msg[BUFFER_LEN];
+    /* store timestamp */
+    char *timestamp = get_timestamp();
+    memcpy(msg->timestamp, timestamp, TIMESTAMP_LEN);
+    free(timestamp);
 
+    /* store sender */
+    strcpy(msg->sender, state->ui.username);
+
+    /* copy message to buffer */
+    char priv_msg[BUFFER_LEN];
+    memset(priv_msg, '\0', BUFFER_LEN);
     strcat(priv_msg, buf);
     strcat(priv_msg, " ");
     strcat(priv_msg, trimmed);
+
+    /* encrypt message with AES */
+    struct aes_key *aes = get_aes_key(msg->sender);
+    unsigned char *plaintext = (unsigned char *) trimmed;
+    unsigned char *ciphertext = aes_encrypt(plaintext, aes);
     memset(msg->buffer, '\0', BUFFER_LEN);
-    strcpy(msg->buffer, priv_msg);
-    return handle_public(state, msg);
+    strcpy(msg->buffer, (char*) ciphertext);
+    free(ciphertext);;
+
+    /* encrypt AES with RSA */
+    unsigned char key_and_iv[AES_LEN + IV_LEN];
+    memset(key_and_iv, '\0', AES_LEN + IV_LEN);
+    strcat((char*)key_and_iv, (char*)aes->key);
+    strcat((char*)key_and_iv, " ");
+    strcat((char*)key_and_iv, (char*)aes->iv);
+    unsigned char *encrypted_aes = use_rsa(msg->sender, key_and_iv, 1);
+    memcpy(msg->aes, encrypted_aes, RSA_LEN-1);
+    msg->aes[RSA_LEN-1] = '\0';
+    free(encrypted_aes);
+
+    if(sign_msg(msg) != 0)  {
+        return -1;
+    }
+    return api_send(state->ssl, state->api.fd, msg);
+}
+
+int handle_msg(struct client_state *state, struct api_msg *msg)    {
+    if(state->logged_in) {
+        /* remove whitespace from message */
+        char trimmed_msg[BUFFER_LEN];
+        memset(trimmed_msg, '\0', BUFFER_LEN);
+        char *trimmed = remove_whitespace(msg->buffer);
+
+        /* copy trimmed message to buffer */
+        memcpy(trimmed_msg, trimmed, strlen(trimmed)+1);
+        memset(msg->buffer, '\0', BUFFER_LEN);
+        memcpy(msg->buffer, trimmed_msg, strlen(trimmed_msg)+1);
+
+        return is_private_msg(msg->buffer) ? handle_private(state, msg) : handle_public(state, msg);
+    }
+    message_user(INVALID_CMD, msg);
+    return -1;
 }
 
 static int client_process_command(struct client_state *state) {
     assert(state);
     int ret = 0;
+
     size_t msg_size = sizeof(struct api_msg);
-    state->eof = 0;
     struct api_msg *msg = calloc(1, msg_size);
+    if(!msg)    {
+        return -1;
+    }
     if(read_input(msg->buffer) == 0)    {
         state->eof = 1;
     }
     else if(is_cmd(msg->buffer))    {
-        int msg_type = get_cmd(msg, state->logged_in);
+        int msg_type = get_msg_type(msg, state->logged_in);
         switch(msg_type)    {
             case REGISTER:
                 ret = handle_register(state, msg);
@@ -172,27 +326,54 @@ static int client_process_command(struct client_state *state) {
                 ret = handle_login(state, msg);
                 break;
             case USERS:
-                ret = handle_users();
+                ret = handle_users(state, msg);
                 break;
             case EXIT:
                 free(msg);
                 exit(EXIT_SUCCESS);
             default:
-                message_user(msg_type, msg->buffer);
+                message_user(msg_type, msg);
                 free(msg);
                 return 0;
         }
         free(msg);
         return ret;
     }
-    else if(is_logged_in(state, 1) && is_valid_msg(msg->buffer)) {
-        if(msg->buffer[0] == '@')   {
-            ret = handle_private(state, msg);
-        }
-        else ret = handle_public(state, msg);
+    else    {
+        ret = handle_msg(state, msg);
     }
     free(msg);
     return ret;
+}
+
+int handle_incoming_privmsg(struct api_msg *msg)   {
+    /* decrypt aes key */
+    unsigned char *decrypted_key = use_rsa(msg->sender, (unsigned char*) msg->aes, 0);
+    if(!decrypted_key)  {
+        return -1;
+    }
+    decrypted_key[AES_LEN-1] = '\0';
+    unsigned char *iv = decrypted_key + AES_LEN;
+
+    /* store key */
+    struct aes_key aes;
+    memset(&aes, 0, sizeof(struct aes_key));
+    memcpy(aes.key, decrypted_key, AES_LEN-1);
+    memcpy(aes.iv, iv, IV_LEN-1);
+
+    /* decrypt message with aes */
+    unsigned char *decrypted_msg = aes_decrypt((unsigned char*) msg->buffer, &aes);
+    if(!decrypted_msg)  {
+        return -1;
+    }
+    /* copy plaintext to buffer */
+    memset(msg->buffer, '\0', BUFFER_LEN);
+    memcpy(msg->buffer, decrypted_msg, BUFFER_LEN-1);
+    msg->buffer[BUFFER_LEN-1] = '\0';
+
+    free(decrypted_msg);
+    free(decrypted_key);
+    return 0;
 }
 
 /**
@@ -201,15 +382,44 @@ static int client_process_command(struct client_state *state) {
  * @param msg     Message to handle
  */
 static int execute_request(struct client_state *state,
-                           const struct api_msg *msg) {
+                           struct api_msg *msg) {
     assert(state);
     assert(msg);
-
-    if(state->logged_in) {
-        printf("%s", msg->buffer);
-        return 0;
+    switch (msg->type)  {
+        case REGISTER:
+            state->logged_in = 1;
+            message_user(REGISTER, NULL);
+            break;
+        case LOGIN:
+            state->logged_in = 1;
+            message_user(LOGIN, NULL);
+            break;
+        case USERS:
+            message_user(USERS, msg);
+            break;
+        case AUTH_ERROR:
+            message_user(AUTH_ERROR, NULL);
+            return -1;
+        default:
+            // todo refactor
+            if(state->logged_in) {
+                if(verify_sig(msg) != 0)    {
+                    perror("invalid signature\n");
+                    return -1;
+                }
+                if(msg->type == PUB_MSG)    {
+                    message_user(PUB_MSG, msg);
+                }
+                else   {
+                    if(handle_incoming_privmsg(msg) != 0)   {
+                        return -1;
+                    }
+                    message_user(PRIV_MSG, msg);
+                }
+            }
+            return 0;
     }
-    return -1;
+    return 0;
 }
 
 /**
@@ -219,11 +429,9 @@ static int execute_request(struct client_state *state,
 static int handle_server_request(struct client_state *state) {
     struct api_msg msg;
     int r, success = 1;
-
     assert(state);
-
     /* wait for incoming request, set eof if there are no more requests */
-    r = api_recv(&state->api, &msg);
+    r = api_recv(state->ssl, &state->api, &msg);
     if (r < 0) return -1;
     if (r == 0) {
         state->eof = 1;
@@ -251,7 +459,6 @@ static int handle_incoming(struct client_state *state) {
     fd_set readfds;
 
     assert(state);
-
     /* TODO if we have work queued up, this might be a good time to do it */
 
     /* TODO ask user for input if needed */
@@ -269,15 +476,12 @@ static int handle_incoming(struct client_state *state) {
         perror("error: select failed");
         return -1;
     }
-
     /* handle ready file descriptors */
     if (FD_ISSET(STDIN_FILENO, &readfds)) {
         return client_process_command(state);
     }
-    /* TODO once you implement encryption you may need to call ssl_has_data
-     * here due to buffering (see ssl-nonblock example)
-     */
-    if (FD_ISSET(state->api.fd, &readfds)) {
+
+    if (FD_ISSET(state->api.fd, &readfds) && ssl_has_data(state->ssl)) {
         return handle_server_request(state);
     }
     return 0;
@@ -289,22 +493,21 @@ static int client_state_init(struct client_state *state) {
 
     /* initialize UI */
     ui_state_init(&state->ui);
+
     state->logged_in = 0;
-
-    /* TODO any additional client state initialization */
-
+    state->ssl = NULL;
     return 0;
 }
 
 static void client_state_free(struct client_state *state) {
-
-    /* TODO any additional client state cleanup */
-
     /* cleanup API state */
     api_state_free(&state->api);
-
     /* cleanup UI state */
     ui_state_free(&state->ui);
+    /* free ssl */
+    if(state->ssl)  {
+        SSL_free(state->ssl);
+    }
 }
 
 static void usage(void) {
@@ -332,7 +535,10 @@ int main(int argc, char **argv) {
     /* initialize API */
     api_state_init(&state.api, fd);
 
-    /* TODO any additional client initialization */
+    if(setup_ssl(&state) != 0)   {
+        printf("SSL setup failed\n");
+        return -1;
+    }
 
     /* client things */
     while (!state.eof && handle_incoming(&state) == 0);

@@ -5,35 +5,23 @@
 #include "parser.h"
 
 int is_valid_username(char *username) {
-    if(strlen(username) >= USERNAME_LEN || is_empty(username))    {
-        return 0;
-    }
-    return 1;
+    return is_empty(username) || strlen(username) >= USERNAME_LEN ? 0 : 1;
 }
 
 int is_valid_pwd(char *pwd) {
-    if(strlen(pwd) >= PWD_LEN || is_empty(pwd))    {
-        return 0;
-    }
-    return 1;
+    return is_empty(pwd) || strlen(pwd) >= PWD_LEN ? 0 : 1;
 }
 
 int is_valid_msg(char *msg) {
-    if(strlen(msg) >= BUFFER_LEN)  {
-        return 0;
-    }
-    return 1;
+    return is_empty(msg) || strlen(msg) >= BUFFER_LEN ? 0 : 1;
 }
 
 int is_empty(const char *msg) {
-    if(msg[0] == '\n' || msg[0] == '\t' || msg[0] == ' ' || msg[0] == '\0')   {
-        return 1;
-    }
-    return 0;
+    return !msg || msg[0] == '\n' || msg[0] == '\t' || msg[0] == ' ' || msg[0] == '\0' || strlen(msg) == 0 ? 1 : 0;
 }
 
 int valid_msg_type(int msg_type) {
-    return msg_type > 0;
+    return msg_type >= 0;
 }
 
 /**
@@ -43,10 +31,7 @@ int valid_msg_type(int msg_type) {
  * @return message type if there are no args, invalid format otherwise
  */
 int no_args(int msg_type, char *arg)   {
-    if(arg == NULL || (is_empty(arg)) > 0) {
-        return msg_type;
-    }
-    return INVALID_FORMAT;
+    return !arg || is_empty(arg) ? msg_type : INVALID_FORMAT;
 }
 
 /**
@@ -58,7 +43,6 @@ char *remove_whitespace(char *msg)    {
         msg++;
     }
     char *end = msg + strlen(msg) - 1;
-
     while (*(end) == ' ')   {
         *(end) = '\0';
         end--;
