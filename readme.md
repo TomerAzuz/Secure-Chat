@@ -4,6 +4,12 @@
 The connection between the server and the client is established using a TCP socket. 
 The server calls `fork` for each incoming connection, thereby allowing to service multiple clients simultaneously. <br>
 
+## Compiling and Running
+From the root directory:
+* `make all`
+* `./server 1234`
+* `./client localhost 1234`
+
 ### Types of Interactions
 * The client interacts with the user via `stdin/stdout` (`read_input()` and `message_user()` in `ui.c`).
   * The input sent by the user is sanitized (in `sanitizer.c`), parsed (in `parser.c`) and processed (in `client.c`).
